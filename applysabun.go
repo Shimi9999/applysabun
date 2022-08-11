@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -43,21 +42,23 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.Close()
+	// TODO:ここで探索対象のテーブルを持つDBファイルか確認するべき
 
-	sabunPaths, err := walkSabunDir(sabunDirPath)
+	sabunInfos, err := walkSabunDir(sabunDirPath)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
 
 	searchResults := map[matchingSign][]SearchResult{}
-	for _, sabunPath := range sabunPaths {
-		result, err := searchBmsDir(sabunPath)
-		if err != nil {
-			fmt.Println(err)
-			if strings.HasPrefix(err.Error(), "Timeout LoadBms: ") {
-				// skip
-			} else {
+	for i := range sabunInfos {
+		var result *SearchResult
+		if sabunInfos[i].LoadingError != nil {
+			result = &SearchResult{SourceSabunInfo: &sabunInfos[i], Sign: ERROR}
+		} else {
+			result, err = searchBmsDirPathFromSDDB(&sabunInfos[i])
+			if err != nil {
+				fmt.Println(err)
 				os.Exit(1)
 			}
 		}
@@ -69,11 +70,12 @@ func main() {
 		fmt.Println("BMS file not found.")
 		os.Exit(1)
 	}
+	fmt.Printf("\nOK:%d, NG:%d, EXIST:%d, ERROR:%d\n",
+		len(searchResults[OK]), len(searchResults[NG]), len(searchResults[EXIST]), len(searchResults[ERROR]))
 	if len(searchResults[OK]) == 0 {
-		fmt.Println("No OK sabuns.")
+		fmt.Println("No OK sabun.")
 		os.Exit(1)
 	}
-	fmt.Printf("\nOK:%d, NG:%d, EXIST:%d\n", len(searchResults[OK]), len(searchResults[NG]), len(searchResults[EXIST]))
 
 	fmt.Printf("Move %d OK sabuns?\n", len(searchResults[OK]))
 	var answer string
@@ -88,139 +90,103 @@ func main() {
 	}
 	fmt.Println("")
 
-	getTargetPath := func(dir, src string, i int) string {
-		base := filepath.Base(src)
-		if i == 0 {
-			return filepath.Join(dir, base)
-		} else {
-			ext := filepath.Ext(base)
-			name := base[:len(base)-len(ext)]
-			return filepath.Join(dir, fmt.Sprintf("%s (%d)%s", name, i, ext))
-		}
+	if err := moveOkSabunFilesAndAdditionalSoundFiles(sabunDirPath, searchResults[OK]); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
 	}
-	for _, r := range searchResults[OK] {
-		sourceBmsPath := r.SourceBmsData.Path
-		var targetBmsPath string
-		isSkip := false
-		for i := 0; ; i++ {
-			targetBmsPath = getTargetPath(r.ResultBmsDirPath, r.SourceBmsData.Path, i)
-			if _, err := os.Stat(targetBmsPath); err != nil {
-				break
-			} else {
-				// ファイル名が同じで内容も同じファイルが存在するなら、ファイル移動処理をスキップする
-				if same, err := isSameFile(sourceBmsPath, targetBmsPath); err != nil {
-					fmt.Println("Failed isSameFile: %w", err)
-					os.Exit(1)
-				} else if same {
-					isSkip = true
-					fmt.Printf("Skip because the same file already exist: %s %s\n", sourceBmsPath, targetBmsPath)
-					break
-				}
-			}
-		}
-		if isSkip {
-			continue
-		}
 
-		if err := moveFile(sourceBmsPath, targetBmsPath); err != nil {
-			fmt.Println("Failed to move sabun: %w", err)
-			os.Exit(1)
-		}
-		fmt.Printf("Moved: %s -> %s\n", sourceBmsPath, targetBmsPath)
-
-		// move後のディレクトリが空(もしくは.txtファイルのみ)ならディレクトリを削除する
-		movedDirPath := filepath.Dir(sourceBmsPath)
-		if filepath.Clean(movedDirPath) != filepath.Clean(sabunDirPath) {
-			if removed, err := removeEmptyDirectory(movedDirPath); err != nil {
-				fmt.Println("Failed to remove empty directory: %w", err)
-				os.Exit(1)
-			} else if removed {
-				fmt.Printf("- Removed empty dir: %s\n", movedDirPath)
-			}
-		}
-	}
 	fmt.Println("\nDone")
 	os.Exit(0)
 }
 
-// パーティションをまたぐファイル移動を可能にする
-func moveFile(sourcePath, targetPath string) error {
-	sourceBytes, err := os.ReadFile(sourcePath)
-	if err != nil {
-		return err
-	}
-
-	if err := os.WriteFile(targetPath, sourceBytes, 0664); err != nil {
-		return err
-	}
-
-	if err := os.Remove(sourcePath); err != nil {
-		return err
-	}
-
-	return nil
+type SabunInfo struct {
+	BmsData                  *gobms.BmsData
+	AdditionalSoundFilePaths []string
+	LoadingError             error
 }
 
-func removeEmptyDirectory(dirPath string) (bool, error) {
-	files, err := os.ReadDir(dirPath)
+func walkSabunDir(sabunDirPath string) (sabunInfos []SabunInfo, _ error) {
+	files, err := os.ReadDir(sabunDirPath)
 	if err != nil {
-		return false, err
+		return nil, fmt.Errorf("ReadDir: %w", err)
 	}
 
-	isEmpty := true
+	// 直下の差分、直下の音源ファイル
+	underDirSabunPaths := []string{}
+	underDirSoundFilePaths := []string{}
+
 	for _, file := range files {
-		if strings.ToLower(filepath.Ext(file.Name())) == ".txt" {
-			// 何もしない
-		} else {
-			isEmpty = false
-			break
+		path := filepath.Join(sabunDirPath, file.Name())
+		if file.IsDir() {
+			sis, err := walkSabunDir(path)
+			if err != nil {
+				return nil, fmt.Errorf("walkSabunDir %s: %w", path, err)
+			}
+			sabunInfos = append(sabunInfos, sis...)
+		} else if gobms.IsBmsPath(path) {
+			underDirSabunPaths = append(underDirSabunPaths, path)
+		} else if isBmsSoundPath(path) {
+			underDirSoundFilePaths = append(underDirSoundFilePaths, path)
 		}
 	}
-	if isEmpty {
-		err := os.RemoveAll(dirPath)
+
+	// bmsデータのロードと追加音源ファイル一覧の作成
+	for _, udSabunPath := range underDirSabunPaths {
+		bmsData, err := loadBms(udSabunPath)
 		if err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-	return false, nil
-}
-
-func isSameFile(path1, path2 string) (bool, error) {
-	bytes1, err := os.ReadFile(path1)
-	if err != nil {
-		return false, err
-	}
-	bytes2, err := os.ReadFile(path2)
-	if err != nil {
-		return false, err
-	}
-	return reflect.DeepEqual(bytes1, bytes2), nil
-}
-
-func walkSabunDir(sabunDirPath string) (sabunPaths []string, _ error) {
-	err := filepath.WalkDir(sabunDirPath, func(path string, info fs.DirEntry, err error) error {
-		if err != nil {
-			return fmt.Errorf("Failed WalkDir: %w", err)
+			if strings.HasPrefix(err.Error(), "Timeout LoadBms: ") {
+				fmt.Println(err)
+				// ローディングがタイムアウトしたらダミーデータを追加する
+				sabunInfos = append(sabunInfos, SabunInfo{
+					BmsData:      &gobms.BmsData{Path: udSabunPath},
+					LoadingError: err})
+				continue
+				// skip
+			} else {
+				return nil, fmt.Errorf("loadBms %s: %w", udSabunPath, err)
+			}
 		}
 
-		if gobms.IsBmsPath(path) {
-			sabunPaths = append(sabunPaths, path)
-			//fmt.Println("isSabun:", path)
+		additionalSoundFilePaths := []string{}
+		wavDefs := copyMap(bmsData.UniqueBmsData.WavDefs)
+		for _, path := range underDirSoundFilePaths {
+			for key, wavDef := range wavDefs {
+				if getPureFileName(path) == getPureFileName(wavDef) {
+					//fmt.Printf("match!: %s %s\n", path, wavDef)
+					additionalSoundFilePaths = append(additionalSoundFilePaths, path)
+					delete(wavDefs, key)
+				}
+			}
 		}
 
-		return nil
-	})
-	return sabunPaths, err
+		sabunInfos = append(sabunInfos, SabunInfo{
+			BmsData:                  bmsData,
+			AdditionalSoundFilePaths: additionalSoundFilePaths,
+			LoadingError:             nil})
+	}
+
+	return sabunInfos, nil
 }
 
-func searchBmsDir(sabunPath string) (*SearchResult, error) {
+func getPureFileName(path string) string {
+	return filepath.Base(path[:len(path)-len(filepath.Ext(path))])
+}
+
+func copyMap(srcMap map[string]string) map[string]string {
+	dstMap := map[string]string{}
+	for key, value := range srcMap {
+		dstMap[key] = value
+	}
+	return dstMap
+}
+
+func loadBms(path string) (bmsData *gobms.BmsData, err error) {
 	// 非常に長いBMSの読み込みはTimeOutで失敗させてスキップする
 	doneLoadBms := make(chan interface{})
-	var bmsData gobms.BmsData
-	var err error
 	go func() {
-		bmsData, err = gobms.LoadBms(sabunPath)
+		var _bmsData gobms.BmsData
+		_bmsData, err = gobms.LoadBms(path)
+		bmsData = &_bmsData
 		close(doneLoadBms)
 	}()
 	select {
@@ -229,15 +195,20 @@ func searchBmsDir(sabunPath string) (*SearchResult, error) {
 			return nil, fmt.Errorf("Failed LoadBms: %w", err)
 		}
 	case <-time.After(5 * time.Second):
-		return nil, fmt.Errorf("Timeout LoadBms: %s", sabunPath)
+		return nil, fmt.Errorf("Timeout LoadBms: %s", path)
 	}
+	return bmsData, nil
+}
 
-	result, err := bmsDirPathFromSDDB(&bmsData)
-	if err != nil {
-		return nil, fmt.Errorf("Failed bmsDirPathFromSDDB: %w", err)
+func isBmsSoundPath(path string) bool {
+	ext := filepath.Ext(path)
+	soundExts := []string{".wav", ".ogg", ".flac", ".mp3"}
+	for _, soundExt := range soundExts {
+		if strings.ToLower(ext) == soundExt {
+			return true
+		}
 	}
-
-	return result, nil
+	return false
 }
 
 type Chart struct {
@@ -278,32 +249,43 @@ func (m matchingResult) String() string {
 type matchingSign string
 
 const (
-	OK    = "OK"
-	NG    = "NG"
-	EXIST = "EXIST"
+	OK    matchingSign = "OK"
+	NG    matchingSign = "NG"
+	EXIST matchingSign = "EXIST"
+	ERROR matchingSign = "ERROR"
 )
 
 type SearchResult struct {
-	Sign             matchingSign
-	SourceBmsData    *gobms.BmsData
+	Sign matchingSign
+	//SourceBmsData    *gobms.BmsData
+	SourceSabunInfo  *SabunInfo
 	ResultBmsDirPath string
 	MatchingLevel    matchingResult
 }
 
 func (r SearchResult) String() string {
-	str := fmt.Sprintf("%s: %s", r.Sign, r.SourceBmsData.Path)
-	if r.Sign != NG {
-		str += fmt.Sprintf(" -> %s", r.ResultBmsDirPath)
-	}
-	if r.Sign != EXIST {
-		str += fmt.Sprintf(" (Matching: %s)", r.MatchingLevel)
+	str := fmt.Sprintf("%s: %s", r.Sign, r.SourceSabunInfo.BmsData.Path)
+	if r.Sign == ERROR {
+		if r.SourceSabunInfo.LoadingError != nil && strings.HasPrefix(r.SourceSabunInfo.LoadingError.Error(), "Timeout LoadBms: ") {
+			str += " -- loading timeout"
+		} else {
+			str += " -- something error"
+		}
+	} else {
+		if r.Sign != NG {
+			str += fmt.Sprintf(" -> %s", r.ResultBmsDirPath)
+		}
+		if r.Sign != EXIST {
+			str += fmt.Sprintf(" (Matching: %s)", r.MatchingLevel)
+		}
 	}
 	return str
 }
 
-func bmsDirPathFromSDDB(bmsData *gobms.BmsData) (result *SearchResult, _ error) {
+func searchBmsDirPathFromSDDB(sabunInfo *SabunInfo) (result *SearchResult, _ error) {
 	result = &SearchResult{}
-	result.SourceBmsData = bmsData
+	result.SourceSabunInfo = sabunInfo
+	bmsData := sabunInfo.BmsData
 
 	// 既に同じsha256の譜面が存在するかを確認
 	rows, err := db.Queryx("SELECT path FROM song WHERE sha256 = $1", bmsData.Sha256)
@@ -412,4 +394,140 @@ func bmsDirPathFromSDDB(bmsData *gobms.BmsData) (result *SearchResult, _ error) 
 	//log = fmt.Sprintf("%s: %s -> %s (Matching: %s)", okngStr, bmsData.Path, bmsDirPath, bestMatchingResult)
 
 	return result, nil
+}
+
+func moveOkSabunFilesAndAdditionalSoundFiles(sabunDirPath string, searchResults []SearchResult) error {
+	getTargetPath := func(dir, src string, duplicationNum int) string {
+		base := filepath.Base(src)
+		if duplicationNum == 0 {
+			return filepath.Join(dir, base)
+		} else {
+			ext := filepath.Ext(base)
+			name := base[:len(base)-len(ext)]
+			return filepath.Join(dir, fmt.Sprintf("%s (%d)%s", name, duplicationNum, ext))
+		}
+	}
+
+	move := func(sourcePath, targetDirPath string, isSabun bool) error {
+		var targetPath string
+		if isSabun {
+			// ファイル名が重複したらナンバリングを追加して再試行
+			for i := 0; ; i++ {
+				targetPath = getTargetPath(targetDirPath, sourcePath, i)
+				if fileExists(targetPath) {
+					// ファイル名が同じで内容も同じファイルが存在するなら、ファイル移動処理をスキップする
+					if same, err := isSameFile(sourcePath, targetPath); err != nil {
+						return fmt.Errorf("Failed isSameFile: %w", err)
+					} else if same {
+						fmt.Printf("Skip because the same file already exist: %s %s\n", sourcePath, targetPath)
+						return nil
+					}
+				} else {
+					break
+				}
+			}
+		} else {
+			targetPath = getTargetPath(targetDirPath, sourcePath, 0)
+			// bmsファイル以外(追加音源ファイルなど)は、移動先に同名ファイルが存在したら、移動処理をスキップする
+			if fileExists(targetPath) {
+				fmt.Printf("Skip because the same file already exist: %s %s\n", sourcePath, targetPath)
+				return nil
+			}
+		}
+
+		//fmt.Printf("move %s => %s\n", sourcePath, targetPath)
+
+		if err := moveFile(sourcePath, targetPath); err != nil {
+			return fmt.Errorf("Failed to move: %w", err)
+		}
+		fmt.Printf("Moved: %s -> %s\n", sourcePath, targetPath)
+
+		// move後のディレクトリが空(もしくは.txtファイルのみ)ならディレクトリを削除する
+		movedDirPath := filepath.Dir(sourcePath)
+		if filepath.Clean(movedDirPath) != filepath.Clean(sabunDirPath) {
+			if removed, err := removeEmptyDirectory(movedDirPath); err != nil {
+				return fmt.Errorf("Failed to remove empty directory: %w", err)
+			} else if removed {
+				fmt.Printf("- Removed empty dir: %s\n", movedDirPath)
+			}
+		}
+
+		return nil
+	}
+
+	for _, r := range searchResults {
+		// 差分BMSファイル移動
+		if err := move(r.SourceSabunInfo.BmsData.Path, r.ResultBmsDirPath, true); err != nil {
+			return err
+		}
+		// 追加音源ファイル移動
+		// TODO 音源が直下でなくディレクトリ内にある場合、移動先にディレクトリを作る必要があるかも？
+		for _, AdditionalSoundFilePath := range r.SourceSabunInfo.AdditionalSoundFilePaths {
+			if err := move(AdditionalSoundFilePath, r.ResultBmsDirPath, false); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func isSameFile(path1, path2 string) (bool, error) {
+	bytes1, err := os.ReadFile(path1)
+	if err != nil {
+		return false, err
+	}
+	bytes2, err := os.ReadFile(path2)
+	if err != nil {
+		return false, err
+	}
+	return reflect.DeepEqual(bytes1, bytes2), nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// パーティションをまたぐことが可能なファイル移動
+func moveFile(sourcePath, targetPath string) error {
+	sourceBytes, err := os.ReadFile(sourcePath)
+	if err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(targetPath, sourceBytes, 0664); err != nil {
+		return err
+	}
+
+	if err := os.Remove(sourcePath); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func removeEmptyDirectory(dirPath string) (bool, error) {
+	files, err := os.ReadDir(dirPath)
+	if err != nil {
+		return false, err
+	}
+
+	isEmpty := true
+	for _, file := range files {
+		if strings.ToLower(filepath.Ext(file.Name())) == ".txt" {
+			// 何もしない
+		} else {
+			isEmpty = false
+			break
+		}
+	}
+	if isEmpty {
+		err := os.RemoveAll(dirPath)
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
 }
