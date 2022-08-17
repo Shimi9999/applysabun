@@ -1,7 +1,6 @@
-package main
+package applysabun
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,97 +14,13 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-var db *sqlx.DB
-
-func main() {
-	usageText := "Usage: applysabun songdata.db-path [sabun-dir-path]"
-	flag.Usage = func() {
-		fmt.Fprint(os.Stderr, usageText)
-	}
-	flag.Parse()
-
-	if len(flag.Args()) == 0 || len(flag.Args()) > 2 {
-		fmt.Println(usageText)
-		os.Exit(1)
-	}
-
-	sddbPath := flag.Arg(0)
-	sabunDirPath := "./"
-	if len(flag.Args()) == 2 {
-		sabunDirPath = flag.Arg(1)
-	}
-
-	var err error
-	db, err = sqlx.Open("sqlite", sddbPath)
-	if err != nil {
-		fmt.Println("database open error: %w", err)
-		os.Exit(1)
-	}
-	defer db.Close()
-	// TODO:ここで探索対象のテーブルを持つDBファイルか確認するべき
-
-	sabunInfos, err := walkSabunDir(sabunDirPath)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-
-	searchResults := map[matchingSign][]SearchResult{}
-	for i := range sabunInfos {
-		var result *SearchResult
-		if sabunInfos[i].LoadingError != nil {
-			result = &SearchResult{SourceSabunInfo: &sabunInfos[i], Sign: ERROR}
-		} else {
-			result, err = searchBmsDirPathFromSDDB(&sabunInfos[i])
-			if err != nil {
-				fmt.Println(err)
-				os.Exit(1)
-			}
-		}
-		fmt.Println(result.String())
-		searchResults[result.Sign] = append(searchResults[result.Sign], *result)
-	}
-
-	if len(searchResults) == 0 {
-		fmt.Println("BMS file not found.")
-		os.Exit(1)
-	}
-	fmt.Printf("\nOK:%d, NG:%d, EXIST:%d, ERROR:%d\n",
-		len(searchResults[OK]), len(searchResults[NG]), len(searchResults[EXIST]), len(searchResults[ERROR]))
-	if len(searchResults[OK]) == 0 {
-		fmt.Println("No OK sabun.")
-		os.Exit(1)
-	}
-
-	fmt.Printf("Move %d OK sabuns?\n", len(searchResults[OK]))
-	var answer string
-	for answer != "y" && answer != "n" {
-		fmt.Printf("(y/n): ")
-		fmt.Scan(&answer)
-		answer = strings.ToLower(answer)
-	}
-	if answer == "n" {
-		fmt.Println("Canceled")
-		os.Exit(0)
-	}
-	fmt.Println("")
-
-	if err := moveOkSabunFilesAndAdditionalSoundFiles(sabunDirPath, searchResults[OK]); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-
-	fmt.Println("\nDone")
-	os.Exit(0)
-}
-
 type SabunInfo struct {
 	BmsData                  *gobms.BmsData
 	AdditionalSoundFilePaths []string
 	LoadingError             error
 }
 
-func walkSabunDir(sabunDirPath string) (sabunInfos []SabunInfo, _ error) {
+func WalkSabunDir(sabunDirPath string) (sabunInfos []SabunInfo, _ error) {
 	files, err := os.ReadDir(sabunDirPath)
 	if err != nil {
 		return nil, fmt.Errorf("ReadDir: %w", err)
@@ -118,7 +33,7 @@ func walkSabunDir(sabunDirPath string) (sabunInfos []SabunInfo, _ error) {
 	for _, file := range files {
 		path := filepath.Join(sabunDirPath, file.Name())
 		if file.IsDir() {
-			sis, err := walkSabunDir(path)
+			sis, err := WalkSabunDir(path)
 			if err != nil {
 				return nil, fmt.Errorf("walkSabunDir %s: %w", path, err)
 			}
@@ -218,10 +133,10 @@ type Chart struct {
 	Path   string `db:"path"`
 }
 
-type matchingResult int
+type MatchingResult int
 
 const (
-	Unmatch matchingResult = iota
+	Unmatch MatchingResult = iota
 	Maybe
 	GenreConditional
 	ArtistConditional
@@ -229,7 +144,7 @@ const (
 	Perfect
 )
 
-func (m matchingResult) String() string {
+func (m MatchingResult) String() string {
 	switch m {
 	case Perfect:
 		return "★ Perfect"
@@ -246,21 +161,21 @@ func (m matchingResult) String() string {
 	}
 }
 
-type matchingSign string
+type MatchingSign string
 
 const (
-	OK    matchingSign = "OK"
-	NG    matchingSign = "NG"
-	EXIST matchingSign = "EXIST"
-	ERROR matchingSign = "ERROR"
+	OK    MatchingSign = "OK"
+	NG    MatchingSign = "NG"
+	EXIST MatchingSign = "EXIST"
+	ERROR MatchingSign = "ERROR"
 )
 
 type SearchResult struct {
-	Sign matchingSign
+	Sign MatchingSign
 	//SourceBmsData    *gobms.BmsData
 	SourceSabunInfo  *SabunInfo
 	ResultBmsDirPath string
-	MatchingLevel    matchingResult
+	MatchingLevel    MatchingResult
 }
 
 func (r SearchResult) String() string {
@@ -282,7 +197,7 @@ func (r SearchResult) String() string {
 	return str
 }
 
-func searchBmsDirPathFromSDDB(sabunInfo *SabunInfo) (result *SearchResult, _ error) {
+func SearchBmsDirPathFromSDDB(sabunInfo *SabunInfo, db *sqlx.DB) (result *SearchResult, _ error) {
 	result = &SearchResult{}
 	result.SourceSabunInfo = sabunInfo
 	bmsData := sabunInfo.BmsData
@@ -312,7 +227,7 @@ func searchBmsDirPathFromSDDB(sabunInfo *SabunInfo) (result *SearchResult, _ err
 
 	//fmt.Printf("%s, %s, %s: %s\n", bmsData.Title, bmsData.Artist, bmsData.Genre, bmsData.Path)
 	var bestChart Chart
-	var bestMatchingResult matchingResult
+	var bestMatchingResult MatchingResult
 	var bestLog string
 	for rows.Next() {
 		var c Chart
@@ -345,7 +260,7 @@ func searchBmsDirPathFromSDDB(sabunInfo *SabunInfo) (result *SearchResult, _ err
 			return nil, stringsSimilarityError(err)
 		}
 
-		var matchingResult matchingResult
+		var matchingResult MatchingResult
 		if ts == 1.0 && as == 1.0 && gs == 1.0 {
 			matchingResult = Perfect
 		} else if ts >= 0.9 && as >= 0.9 && gs >= 0.9 {
@@ -396,7 +311,7 @@ func searchBmsDirPathFromSDDB(sabunInfo *SabunInfo) (result *SearchResult, _ err
 	return result, nil
 }
 
-func moveOkSabunFilesAndAdditionalSoundFiles(sabunDirPath string, searchResults []SearchResult) error {
+func MoveOkSabunFilesAndAdditionalSoundFiles(sabunDirPath string, searchResults []SearchResult) error {
 	getTargetPath := func(dir, src string, duplicationNum int) string {
 		base := filepath.Base(src)
 		if duplicationNum == 0 {

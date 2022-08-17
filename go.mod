@@ -1,4 +1,4 @@
-module applysabun
+module github.com/Shimi9999/applysabun
 
 go 1.17
 
