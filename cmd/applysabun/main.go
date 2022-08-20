@@ -45,34 +45,35 @@ func main() {
 		os.Exit(1)
 	}
 
-	searchResults := map[applysabun.MatchingSign][]applysabun.SearchResult{}
-	for i := range sabunInfos {
+	sabunInfoSignMap := map[applysabun.MatchingSign][]applysabun.SabunInfo{}
+	for i, sabunInfo := range sabunInfos {
 		var result *applysabun.SearchResult
-		if sabunInfos[i].LoadingError != nil {
-			result = &applysabun.SearchResult{SourceSabunInfo: &sabunInfos[i], Sign: applysabun.ERROR}
+		if sabunInfo.LoadingError != nil {
+			result = &applysabun.SearchResult{Sign: applysabun.ERROR}
 		} else {
-			result, err = applysabun.SearchBmsDirPathFromSDDB(&sabunInfos[i], db)
+			result, err = applysabun.SearchBmsDirPathFromSDDB(sabunInfo.BmsData, db)
 			if err != nil {
 				fmt.Println(err)
 				os.Exit(1)
 			}
 		}
-		fmt.Println(result.String())
-		searchResults[result.Sign] = append(searchResults[result.Sign], *result)
+		fmt.Println(result.String(&sabunInfos[i]))
+		sabunInfo.TargetSearchResult = result
+		sabunInfoSignMap[result.Sign] = append(sabunInfoSignMap[result.Sign], sabunInfo)
 	}
 
-	if len(searchResults) == 0 {
+	if len(sabunInfoSignMap) == 0 {
 		fmt.Println("BMS file not found.")
 		os.Exit(1)
 	}
 	fmt.Printf("\nOK:%d, NG:%d, EXIST:%d, ERROR:%d\n",
-		len(searchResults[applysabun.OK]), len(searchResults[applysabun.NG]), len(searchResults[applysabun.EXIST]), len(searchResults[applysabun.ERROR]))
-	if len(searchResults[applysabun.OK]) == 0 {
+		len(sabunInfoSignMap[applysabun.OK]), len(sabunInfoSignMap[applysabun.NG]), len(sabunInfoSignMap[applysabun.EXIST]), len(sabunInfoSignMap[applysabun.ERROR]))
+	if len(sabunInfoSignMap[applysabun.OK]) == 0 {
 		fmt.Println("No OK sabun.")
 		os.Exit(1)
 	}
 
-	fmt.Printf("Move %d OK sabuns?\n", len(searchResults[applysabun.OK]))
+	fmt.Printf("Move %d OK sabuns?\n", len(sabunInfoSignMap[applysabun.OK]))
 	var answer string
 	for answer != "y" && answer != "n" {
 		fmt.Printf("(y/n): ")
@@ -85,9 +86,11 @@ func main() {
 	}
 	fmt.Println("")
 
-	if err := applysabun.MoveOkSabunFilesAndAdditionalSoundFiles(sabunDirPath, searchResults[applysabun.OK]); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+	for i := range sabunInfoSignMap[applysabun.OK] {
+		if err := applysabun.MoveSabunFileAndAdditionalSoundFiles(sabunDirPath, &sabunInfoSignMap[applysabun.OK][i]); err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
 	}
 
 	fmt.Println("\nDone")

@@ -26,6 +26,7 @@ type SabunInfo struct {
 	BmsData                  *gobms.BmsData
 	AdditionalSoundFilePaths []string
 	LoadingError             error
+	TargetSearchResult       *SearchResult
 }
 
 func WalkSabunDir(sabunDirPath string) (sabunInfos []SabunInfo, _ error) {
@@ -179,24 +180,22 @@ const (
 )
 
 type SearchResult struct {
-	Sign MatchingSign
-	//SourceBmsData    *gobms.BmsData
-	SourceSabunInfo  *SabunInfo
-	ResultBmsDirPath string
+	Sign             MatchingSign
+	TargetBmsDirPath string
 	MatchingLevel    MatchingResult
 }
 
-func (r SearchResult) String() string {
-	str := fmt.Sprintf("%s: %s", r.Sign, r.SourceSabunInfo.BmsData.Path)
+func (r SearchResult) String(sourceSabunInfo *SabunInfo) string {
+	str := fmt.Sprintf("%s: %s", r.Sign, sourceSabunInfo.BmsData.Path)
 	if r.Sign == ERROR {
-		if r.SourceSabunInfo.LoadingError != nil && strings.HasPrefix(r.SourceSabunInfo.LoadingError.Error(), "Timeout LoadBms: ") {
+		if sourceSabunInfo.LoadingError != nil && strings.HasPrefix(sourceSabunInfo.LoadingError.Error(), "Timeout LoadBms: ") {
 			str += " -- loading timeout"
 		} else {
 			str += " -- something error"
 		}
 	} else {
 		if r.Sign != NG {
-			str += fmt.Sprintf(" -> %s", r.ResultBmsDirPath)
+			str += fmt.Sprintf(" -> %s", r.TargetBmsDirPath)
 		}
 		if r.Sign != EXIST {
 			str += fmt.Sprintf(" (Matching: %s)", r.MatchingLevel)
@@ -205,10 +204,8 @@ func (r SearchResult) String() string {
 	return str
 }
 
-func SearchBmsDirPathFromSDDB(sabunInfo *SabunInfo, db *sqlx.DB) (result *SearchResult, _ error) {
+func SearchBmsDirPathFromSDDB(bmsData *gobms.BmsData, db *sqlx.DB) (result *SearchResult, _ error) {
 	result = &SearchResult{}
-	result.SourceSabunInfo = sabunInfo
-	bmsData := sabunInfo.BmsData
 
 	// 既に同じsha256の譜面が存在するかを確認
 	rows, err := db.Queryx("SELECT path FROM song WHERE sha256 = $1", bmsData.Sha256)
@@ -222,7 +219,7 @@ func SearchBmsDirPathFromSDDB(sabunInfo *SabunInfo, db *sqlx.DB) (result *Search
 			return nil, fmt.Errorf("Failed rows.StructScan: %w", err)
 		}
 		result.Sign = EXIST
-		result.ResultBmsDirPath = filepath.Dir(c.Path)
+		result.TargetBmsDirPath = filepath.Dir(c.Path)
 		return result, nil
 	}
 
@@ -309,7 +306,7 @@ func SearchBmsDirPathFromSDDB(sabunInfo *SabunInfo, db *sqlx.DB) (result *Search
 		}
 	} else {
 		result.Sign = OK
-		result.ResultBmsDirPath = filepath.Dir(bestChart.Path)
+		result.TargetBmsDirPath = filepath.Dir(bestChart.Path)
 	}
 	//fmt.Printf("  %s -> %s\n", bestMatchingResult.String(), bmsDirPath)
 	//fmt.Print(bestLog)
@@ -319,7 +316,7 @@ func SearchBmsDirPathFromSDDB(sabunInfo *SabunInfo, db *sqlx.DB) (result *Search
 	return result, nil
 }
 
-func MoveOkSabunFilesAndAdditionalSoundFiles(sabunDirPath string, searchResults []SearchResult) error {
+func MoveSabunFileAndAdditionalSoundFiles(sabunDirPath string, sabunInfo *SabunInfo) error {
 	getTargetPath := func(dir, src string, duplicationNum int) string {
 		base := filepath.Base(src)
 		if duplicationNum == 0 {
@@ -378,17 +375,19 @@ func MoveOkSabunFilesAndAdditionalSoundFiles(sabunDirPath string, searchResults 
 		return nil
 	}
 
-	for _, r := range searchResults {
-		// 差分BMSファイル移動
-		if err := move(r.SourceSabunInfo.BmsData.Path, r.ResultBmsDirPath, true); err != nil {
+	if sabunInfo.TargetSearchResult == nil {
+		return fmt.Errorf("TargetSearchResult is nil")
+	}
+
+	// 差分BMSファイル移動
+	if err := move(sabunInfo.BmsData.Path, sabunInfo.TargetSearchResult.TargetBmsDirPath, true); err != nil {
+		return err
+	}
+	// 追加音源ファイル移動
+	// TODO 音源が直下でなくディレクトリ内にある場合、移動先にディレクトリを作る必要があるかも？
+	for _, AdditionalSoundFilePath := range sabunInfo.AdditionalSoundFilePaths {
+		if err := move(AdditionalSoundFilePath, sabunInfo.TargetSearchResult.TargetBmsDirPath, false); err != nil {
 			return err
-		}
-		// 追加音源ファイル移動
-		// TODO 音源が直下でなくディレクトリ内にある場合、移動先にディレクトリを作る必要があるかも？
-		for _, AdditionalSoundFilePath := range r.SourceSabunInfo.AdditionalSoundFilePaths {
-			if err := move(AdditionalSoundFilePath, r.ResultBmsDirPath, false); err != nil {
-				return err
-			}
 		}
 	}
 
