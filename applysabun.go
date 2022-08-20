@@ -14,6 +14,14 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func OpenSongdb(path string) (*sqlx.DB, error) {
+	db, err := sqlx.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	return db, nil
+}
+
 type SabunInfo struct {
 	BmsData                  *gobms.BmsData
 	AdditionalSoundFilePaths []string

@@ -31,7 +31,7 @@ func main() {
 	}
 
 	var err error
-	db, err = sqlx.Open("sqlite", sddbPath)
+	db, err = applysabun.OpenSongdb(sddbPath)
 	if err != nil {
 		fmt.Println("database open error: %w", err)
 		os.Exit(1)
