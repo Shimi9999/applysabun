@@ -19,6 +19,42 @@ func OpenSongdb(path string) (*sqlx.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// songテーブルと必要カラムの存在確認
+	rows, err := db.Queryx("SELECT * FROM song LIMIT 1")
+	if err != nil {
+		return nil, fmt.Errorf("There is no song table in the DB.")
+	}
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("Columns error: %w", err)
+	}
+
+	mustColsMap := map[string]bool{
+		"title":  false,
+		"genre":  false,
+		"artist": false,
+		"path":   false,
+	}
+	hashIsOk := false
+	for _, col := range cols {
+		if col == "hash" || col == "sha256" {
+			hashIsOk = true
+		}
+		if _, ok := mustColsMap[col]; ok {
+			mustColsMap[col] = true
+		}
+	}
+
+	if !hashIsOk {
+		return nil, fmt.Errorf("There is no hash/sha256 column in the song table.")
+	}
+	for key, value := range mustColsMap {
+		if !value {
+			return nil, fmt.Errorf("There is no %s column in the song table.", key)
+		}
+	}
+
 	return db, nil
 }
 
@@ -207,8 +243,18 @@ func (r SearchResult) String(sourceSabunInfo *SabunInfo) string {
 func SearchBmsDirPathFromSDDB(bmsData *gobms.BmsData, db *sqlx.DB) (result *SearchResult, _ error) {
 	result = &SearchResult{}
 
-	// 既に同じsha256の譜面が存在するかを確認
-	rows, err := db.Queryx("SELECT path FROM song WHERE sha256 = $1", bmsData.Sha256)
+	isBeatoraja, isLR2, err := dbIsBeatorajaOrLR2(db)
+	if err != nil {
+		return nil, fmt.Errorf("Failed dbIsBeatorajaOrLR2: %w", err)
+	}
+
+	// 既に同じハッシュの譜面が存在するかを確認 (beatorajaはsha256、LR2はmd5)
+	var rows *sqlx.Rows
+	if isBeatoraja {
+		rows, err = db.Queryx("SELECT path FROM song WHERE sha256 = $1", bmsData.Sha256)
+	} else if isLR2 {
+		rows, err = db.Queryx("SELECT path FROM song WHERE hash = $1", bmsData.Md5)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("Failed db.Query: %w", err)
 	}
@@ -314,6 +360,25 @@ func SearchBmsDirPathFromSDDB(bmsData *gobms.BmsData, db *sqlx.DB) (result *Sear
 	//log = fmt.Sprintf("%s: %s -> %s (Matching: %s)", okngStr, bmsData.Path, bmsDirPath, bestMatchingResult)
 
 	return result, nil
+}
+
+func dbIsBeatorajaOrLR2(db *sqlx.DB) (isBeatoraja, isLR2 bool, _ error) {
+	rows, err := db.Queryx("SELECT * FROM song LIMIT 1")
+	if err != nil {
+		return false, false, fmt.Errorf("Queryx error: %w", err)
+	}
+	cols, err := rows.Columns()
+	if err != nil {
+		return false, false, fmt.Errorf("Columns error: %w", err)
+	}
+	for _, col := range cols {
+		if col == "sha256" {
+			return true, false, nil
+		} else if col == "hash" {
+			return false, true, nil
+		}
+	}
+	return false, false, fmt.Errorf("Neither.")
 }
 
 func MoveSabunFileAndAdditionalSoundFiles(sabunDirPath string, sabunInfo *SabunInfo) error {
