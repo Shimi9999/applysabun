@@ -65,10 +65,35 @@ type SabunInfo struct {
 	TargetSearchResult       *SearchResult
 }
 
+// チャネル通信用のインデックス付きSabunInfo
+type sabunInfoWithIndex struct {
+	SabunInfo *SabunInfo
+	Index     int
+	Error     error
+}
+
 func WalkSabunDir(sabunDirPath string) (sabunInfos []SabunInfo, _ error) {
+	// 非同期にBMSファイルのロード、Infoの作成を行う
+	infoCh := make(chan *sabunInfoWithIndex)
+	err := _walkSabunDir(infoCh, sabunDirPath, &sabunInfos)
+	if err != nil {
+		return nil, fmt.Errorf("walkSabunDir %s: %w", sabunDirPath, err)
+	}
+	for i := 0; i < len(sabunInfos); i++ {
+		infoWithIndex := <-infoCh
+		if infoWithIndex.Error != nil {
+			return nil, fmt.Errorf("walkSabunDir %s: %w", sabunDirPath, infoWithIndex.Error)
+		}
+		sabunInfos[infoWithIndex.Index] = *infoWithIndex.SabunInfo
+	}
+
+	return sabunInfos, nil
+}
+
+func _walkSabunDir(infoCh chan *sabunInfoWithIndex, sabunDirPath string, sabunInfos *[]SabunInfo) error {
 	files, err := os.ReadDir(sabunDirPath)
 	if err != nil {
-		return nil, fmt.Errorf("ReadDir: %w", err)
+		return fmt.Errorf("ReadDir: %w", err)
 	}
 
 	// 直下の差分、直下の音源ファイル
@@ -78,11 +103,10 @@ func WalkSabunDir(sabunDirPath string) (sabunInfos []SabunInfo, _ error) {
 	for _, file := range files {
 		path := filepath.Join(sabunDirPath, file.Name())
 		if file.IsDir() {
-			sis, err := WalkSabunDir(path)
+			err := _walkSabunDir(infoCh, path, sabunInfos)
 			if err != nil {
-				return nil, fmt.Errorf("walkSabunDir %s: %w", path, err)
+				return err
 			}
-			sabunInfos = append(sabunInfos, sis...)
 		} else if gobms.IsBmsPath(path) {
 			underDirSabunPaths = append(underDirSabunPaths, path)
 		} else if isBmsSoundPath(path) {
@@ -92,40 +116,53 @@ func WalkSabunDir(sabunDirPath string) (sabunInfos []SabunInfo, _ error) {
 
 	// bmsデータのロードと追加音源ファイル一覧の作成
 	for _, udSabunPath := range underDirSabunPaths {
-		bmsData, err := loadBms(udSabunPath)
-		if err != nil {
-			if strings.HasPrefix(err.Error(), "Timeout LoadBms: ") {
-				fmt.Println(err)
-				// ローディングがタイムアウトしたらダミーデータを追加する
-				sabunInfos = append(sabunInfos, SabunInfo{
-					BmsData:      &gobms.BmsData{Path: udSabunPath},
-					LoadingError: err})
-				continue
-				// skip
-			} else {
-				return nil, fmt.Errorf("loadBms %s: %w", udSabunPath, err)
-			}
-		}
+		sabunInfo := SabunInfo{}
+		*sabunInfos = append(*sabunInfos, sabunInfo)
 
-		additionalSoundFilePaths := []string{}
-		wavDefs := copyMap(bmsData.UniqueBmsData.WavDefs)
-		for _, path := range underDirSoundFilePaths {
-			for key, wavDef := range wavDefs {
-				if getPureFileName(path) == getPureFileName(wavDef) {
-					//fmt.Printf("match!: %s %s\n", path, wavDef)
-					additionalSoundFilePaths = append(additionalSoundFilePaths, path)
-					delete(wavDefs, key)
-				}
+		sabunPath := udSabunPath
+		index := len(*sabunInfos) - 1
+		go func() {
+			_sabunInfo, err := makeSabunInfo(sabunPath, underDirSoundFilePaths)
+			if err != nil {
+				err = fmt.Errorf("makeSabunInfo: %w", err)
 			}
-		}
-
-		sabunInfos = append(sabunInfos, SabunInfo{
-			BmsData:                  bmsData,
-			AdditionalSoundFilePaths: additionalSoundFilePaths,
-			LoadingError:             nil})
+			s := sabunInfoWithIndex{SabunInfo: _sabunInfo, Index: index, Error: err}
+			infoCh <- &s
+		}()
 	}
 
-	return sabunInfos, nil
+	return nil
+}
+
+func makeSabunInfo(sabunPath string, soundFilePaths []string) (*SabunInfo, error) {
+	bmsData, err := loadBms(sabunPath)
+	if err != nil {
+		if strings.HasPrefix(err.Error(), "Timeout LoadBms: ") {
+			fmt.Println(err)
+			// ローディングがタイムアウトしたらダミーデータを返す
+			return &SabunInfo{
+				BmsData:      &gobms.BmsData{Path: sabunPath},
+				LoadingError: err}, nil
+		} else {
+			return nil, fmt.Errorf("loadBms %s: %w", sabunPath, err)
+		}
+	}
+
+	additionalSoundFilePaths := []string{}
+	wavDefs := copyMap(bmsData.UniqueBmsData.WavDefs)
+	for _, path := range soundFilePaths {
+		for key, wavDef := range wavDefs {
+			if getPureFileName(path) == getPureFileName(wavDef) {
+				additionalSoundFilePaths = append(additionalSoundFilePaths, path)
+				delete(wavDefs, key)
+			}
+		}
+	}
+
+	return &SabunInfo{
+		BmsData:                  bmsData,
+		AdditionalSoundFilePaths: additionalSoundFilePaths,
+		LoadingError:             nil}, nil
 }
 
 func getPureFileName(path string) string {
