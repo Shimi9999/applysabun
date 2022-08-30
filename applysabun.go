@@ -21,7 +21,7 @@ func OpenSongdb(path string) (*sqlx.DB, error) {
 	}
 
 	// songテーブルと必要カラムの存在確認
-	rows, err := db.Queryx("SELECT * FROM song LIMIT 1")
+	rows, err := retryableQuery(db, "SELECT * FROM song LIMIT 1")
 	if err != nil {
 		return nil, fmt.Errorf("There is no song table in the DB.")
 	}
@@ -56,6 +56,24 @@ func OpenSongdb(path string) (*sqlx.DB, error) {
 	}
 
 	return db, nil
+}
+
+// SQLITE_BUSYの場合にリトライするQuery
+func retryableQuery(db *sqlx.DB, query string, args ...interface{}) (*sqlx.Rows, error) {
+	for i := 0; i < 10; i++ {
+		rows, err := db.Queryx(query, args...)
+		if err != nil {
+			if strings.Contains(err.Error(), "SQLITE_BUSY") {
+				time.Sleep(500 * time.Millisecond)
+				continue
+			} else {
+				return nil, err
+			}
+		} else {
+			return rows, nil
+		}
+	}
+	return nil, fmt.Errorf("Failed retrying query")
 }
 
 type SabunInfo struct {
@@ -318,12 +336,12 @@ func SearchBmsDirPathFromSDDB(bmsData *gobms.BmsData, db *sqlx.DB) (result *Sear
 	// 既に同じハッシュの譜面が存在するかを確認 (beatorajaはsha256、LR2はmd5)
 	var rows *sqlx.Rows
 	if isBeatoraja {
-		rows, err = db.Queryx("SELECT path FROM song WHERE sha256 = $1", bmsData.Sha256)
+		rows, err = retryableQuery(db, "SELECT path FROM song WHERE sha256 = $1", bmsData.Sha256)
 	} else if isLR2 {
-		rows, err = db.Queryx("SELECT path FROM song WHERE hash = $1", bmsData.Md5)
+		rows, err = retryableQuery(db, "SELECT path FROM song WHERE hash = $1", bmsData.Md5)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("Failed db.Query: %w", err)
+		return nil, fmt.Errorf("Failed query: %w", err)
 	}
 	if rows.Next() {
 		var c Chart
@@ -337,9 +355,9 @@ func SearchBmsDirPathFromSDDB(bmsData *gobms.BmsData, db *sqlx.DB) (result *Sear
 	}
 
 	pureTitle := gobms.RemoveSuffixChartName(bmsData.Title)
-	rows, err = db.Queryx("SELECT title, genre, artist, path FROM song WHERE title LIKE $1", pureTitle+"%")
+	rows, err = retryableQuery(db, "SELECT title, genre, artist, path FROM song WHERE title LIKE $1", pureTitle+"%")
 	if err != nil {
-		return nil, fmt.Errorf("Failed db.Query: %w", err)
+		return nil, fmt.Errorf("Failed query: %w", err)
 	}
 	defer rows.Close()
 
@@ -436,9 +454,9 @@ func SearchBmsDirPathFromSDDB(bmsData *gobms.BmsData, db *sqlx.DB) (result *Sear
 }
 
 func dbIsBeatorajaOrLR2(db *sqlx.DB) (isBeatoraja, isLR2 bool, _ error) {
-	rows, err := db.Queryx("SELECT * FROM song LIMIT 1")
+	rows, err := retryableQuery(db, "SELECT * FROM song LIMIT 1")
 	if err != nil {
-		return false, false, fmt.Errorf("Queryx error: %w", err)
+		return false, false, fmt.Errorf("Query error: %w", err)
 	}
 	cols, err := rows.Columns()
 	if err != nil {
