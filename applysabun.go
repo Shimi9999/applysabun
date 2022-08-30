@@ -215,10 +215,10 @@ type Chart struct {
 	Path   string `db:"path"`
 }
 
-type MatchingResult int
+type MatchingLevel int
 
 const (
-	Unmatch MatchingResult = iota
+	Unmatch MatchingLevel = iota
 	Maybe
 	GenreConditional
 	ArtistConditional
@@ -226,7 +226,7 @@ const (
 	Perfect
 )
 
-func (m MatchingResult) String() string {
+func (m MatchingLevel) String() string {
 	switch m {
 	case Perfect:
 		return "★ Perfect"
@@ -252,10 +252,33 @@ const (
 	ERROR MatchingSign = "ERROR"
 )
 
+type WavDefsMatchingResult struct {
+	MatchingNum  int
+	WavDefsNum   int
+	MatchingRate float64
+}
+
+func (r WavDefsMatchingResult) String() string {
+	return fmt.Sprintf("%d/%d,%.3f", r.MatchingNum, r.WavDefsNum, r.MatchingRate)
+}
+
+// ソースBMSのWAV定義を基準に、ターゲットBMSのWAV定義との一致情報を返す
+func matchingWavDefs(sourceBmsData, targetBmsData *gobms.UniqueBmsData) *WavDefsMatchingResult {
+	r := WavDefsMatchingResult{WavDefsNum: len(sourceBmsData.WavDefs)}
+	for key, value := range sourceBmsData.WavDefs {
+		if tValue, ok := targetBmsData.WavDefs[key]; ok && removeExt(value) == removeExt(tValue) {
+			r.MatchingNum++
+		}
+	}
+	r.MatchingRate = float64(r.MatchingNum) / float64(len(sourceBmsData.WavDefs))
+	return &r
+}
+
 type SearchResult struct {
-	Sign             MatchingSign
-	TargetBmsDirPath string
-	MatchingLevel    MatchingResult
+	Sign                  MatchingSign
+	TargetBmsDirPath      string
+	MatchingLevel         MatchingLevel
+	WavDefsMatchingResult *WavDefsMatchingResult
 }
 
 func (r SearchResult) String(sourceSabunInfo *SabunInfo) string {
@@ -278,6 +301,13 @@ func (r SearchResult) String(sourceSabunInfo *SabunInfo) string {
 }
 
 func SearchBmsDirPathFromSDDB(bmsData *gobms.BmsData, db *sqlx.DB) (result *SearchResult, _ error) {
+	if bmsData == nil {
+		return nil, fmt.Errorf("bmsData is nil")
+	}
+	if db == nil {
+		return nil, fmt.Errorf("db is nil")
+	}
+
 	result = &SearchResult{}
 
 	isBeatoraja, isLR2, err := dbIsBeatorajaOrLR2(db)
@@ -313,18 +343,14 @@ func SearchBmsDirPathFromSDDB(bmsData *gobms.BmsData, db *sqlx.DB) (result *Sear
 	}
 	defer rows.Close()
 
-	//fmt.Printf("%s, %s, %s: %s\n", bmsData.Title, bmsData.Artist, bmsData.Genre, bmsData.Path)
 	var bestChart Chart
-	var bestMatchingResult MatchingResult
-	var bestLog string
+	var bestMatchingLevel MatchingLevel
 	for rows.Next() {
 		var c Chart
 		err := rows.StructScan(&c)
 		if err != nil {
 			return nil, fmt.Errorf("Failed rows.StructScan: %w", err)
 		}
-
-		//fmt.Printf("  title: %s, path: %s\n", c.Title, c.Path)
 
 		stringsSimilarityError := func(err error) error {
 			return fmt.Errorf("Failed StringsSimilarity: %w", err)
@@ -348,53 +374,63 @@ func SearchBmsDirPathFromSDDB(bmsData *gobms.BmsData, db *sqlx.DB) (result *Sear
 			return nil, stringsSimilarityError(err)
 		}
 
-		var matchingResult MatchingResult
+		var matchingLevel MatchingLevel
 		if ts == 1.0 && as == 1.0 && gs == 1.0 {
-			matchingResult = Perfect
+			matchingLevel = Perfect
 		} else if ts >= 0.9 && as >= 0.9 && gs >= 0.9 {
-			matchingResult = Almost
-		} else if ts >= 0.9 && strings.HasPrefix(bmsData.Artist, c.Artist) && gs >= 0.9 {
-			matchingResult = ArtistConditional
+			matchingLevel = Almost
+		} else if ts >= 0.9 &&
+			(bmsData.Artist != "" && c.Artist != "" && (strings.HasPrefix(bmsData.Artist, c.Artist) || strings.HasPrefix(c.Artist, bmsData.Artist))) &&
+			gs >= 0.9 {
+			matchingLevel = ArtistConditional
 		} else if ts >= 0.9 && as >= 0.9 {
-			matchingResult = GenreConditional
+			matchingLevel = GenreConditional
 		} else if ts >= 0.8 && as+gs >= 1.5 {
-			matchingResult = Maybe
+			matchingLevel = Maybe
 		} else {
-			matchingResult = Unmatch
+			matchingLevel = Unmatch
 		}
 
-		if matchingResult > bestMatchingResult {
-			bestMatchingResult = matchingResult
+		if matchingLevel >= Maybe {
+			// WAV定義の一致率を調べ、最大のものを選ぶ。100%なら確定。
+			targetBmsData, err := loadBms(c.Path)
+			if err != nil {
+				//return nil, fmt.Errorf("Failed loadBms: %w", err)
+				continue
+			}
+			if bmsData.UniqueBmsData == nil || targetBmsData.UniqueBmsData == nil {
+				continue
+			} else {
+				wdmr := matchingWavDefs(targetBmsData.UniqueBmsData, bmsData.UniqueBmsData)
+				if result.WavDefsMatchingResult == nil {
+					result.WavDefsMatchingResult = wdmr
+				} else if wdmr.MatchingRate > result.WavDefsMatchingResult.MatchingRate {
+					result.WavDefsMatchingResult = wdmr
+					if wdmr.MatchingRate == 1.0 {
+						bestMatchingLevel = matchingLevel
+						bestChart = c
+						break
+					}
+				}
+			}
+		}
+
+		if matchingLevel > bestMatchingLevel {
+			bestMatchingLevel = matchingLevel
 			bestChart = c
-			bestLog = fmt.Sprintf("    %s: %f, %f, %f: (%s - %s)(%s - %s)(%s - %s)\n", matchingResult.String(), ts, as, gs, pureTitle, cPureTitle, bmsData.Artist, c.Artist, pureGenre, cPureGenre)
-		}
-		if matchingResult == Perfect {
-			break
-		}
-
-		if bestMatchingResult == Unmatch && ts+as+gs >= 1.5 {
-			bestLog = fmt.Sprintf("    %s: %f, %f, %f: (%s - %s)(%s - %s)(%s - %s)\n", matchingResult.String(), ts, as, gs, pureTitle, cPureTitle, bmsData.Artist, c.Artist, pureGenre, cPureGenre)
 		}
 	}
 	if rows.Err() != nil {
 		return nil, fmt.Errorf("rows scan error: %w", err)
 	}
 
-	result.MatchingLevel = bestMatchingResult
-	if bestMatchingResult == Unmatch {
+	result.MatchingLevel = bestMatchingLevel
+	if bestMatchingLevel == Unmatch {
 		result.Sign = NG
-		//fmt.Printf("  %s\n", bestMatchingResult.String())
-		if bestLog != "" {
-			//fmt.Print(bestLog)
-		}
 	} else {
 		result.Sign = OK
 		result.TargetBmsDirPath = filepath.Dir(bestChart.Path)
 	}
-	//fmt.Printf("  %s -> %s\n", bestMatchingResult.String(), bmsDirPath)
-	//fmt.Print(bestLog)
-
-	//log = fmt.Sprintf("%s: %s -> %s (Matching: %s)", okngStr, bmsData.Path, bmsDirPath, bestMatchingResult)
 
 	return result, nil
 }
@@ -416,6 +452,10 @@ func dbIsBeatorajaOrLR2(db *sqlx.DB) (isBeatoraja, isLR2 bool, _ error) {
 		}
 	}
 	return false, false, fmt.Errorf("Neither.")
+}
+
+func removeExt(path string) string {
+	return path[:len(path)-len(filepath.Ext(path))]
 }
 
 func MoveSabunFileAndAdditionalSoundFiles(sabunDirPath string, sabunInfo *SabunInfo) error {
