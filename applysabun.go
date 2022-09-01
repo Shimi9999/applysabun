@@ -295,6 +295,7 @@ func matchingWavDefs(sourceBmsData, targetBmsData *gobms.UniqueBmsData) *WavDefs
 type SearchResult struct {
 	Sign                  MatchingSign
 	TargetBmsDirPath      string
+	MatchedBmsData        *gobms.BmsData
 	MatchingLevel         MatchingLevel
 	WavDefsMatchingResult *WavDefsMatchingResult
 }
@@ -427,15 +428,17 @@ func SearchBmsDirPathFromSDDB(bmsData *gobms.BmsData, db *sqlx.DB) (result *Sear
 					if wdmr.MatchingRate == 1.0 {
 						bestMatchingLevel = matchingLevel
 						bestChart = c
+						result.MatchedBmsData = targetBmsData
 						break
 					}
 				}
 			}
-		}
 
-		if matchingLevel > bestMatchingLevel {
-			bestMatchingLevel = matchingLevel
-			bestChart = c
+			if matchingLevel > bestMatchingLevel {
+				bestMatchingLevel = matchingLevel
+				bestChart = c
+				result.MatchedBmsData = targetBmsData
+			}
 		}
 	}
 	if rows.Err() != nil {
