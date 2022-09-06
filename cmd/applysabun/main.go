@@ -87,9 +87,13 @@ func main() {
 	fmt.Println("")
 
 	for i := range sabunInfoSignMap[applysabun.OK] {
-		if err := applysabun.MoveSabunFileAndAdditionalSoundFiles(sabunDirPath, &sabunInfoSignMap[applysabun.OK][i]); err != nil {
+		if logs, err := applysabun.MoveSabunFileAndAdditionalSoundFiles(sabunDirPath, &sabunInfoSignMap[applysabun.OK][i]); err != nil {
 			fmt.Println(err)
 			os.Exit(1)
+		} else {
+			for _, log := range logs {
+				fmt.Println(log)
+			}
 		}
 	}
 

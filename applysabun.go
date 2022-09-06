@@ -479,7 +479,23 @@ func removeExt(path string) string {
 	return path[:len(path)-len(filepath.Ext(path))]
 }
 
-func MoveSabunFileAndAdditionalSoundFiles(sabunDirPath string, sabunInfo *SabunInfo) error {
+type MovedFileLog struct {
+	SourcePath   string
+	TargetPath   string // IsRemoveDir=trueなら使用しない
+	IsSkipped    bool
+	IsRemovedDir bool
+}
+
+func (log MovedFileLog) String() string {
+	if log.IsRemovedDir {
+		return fmt.Sprintf("- Removed empty dir: %s", log.SourcePath)
+	} else if log.IsSkipped {
+		return fmt.Sprintf("Skipped because the same file already exist: %s = %s", log.SourcePath, log.TargetPath)
+	}
+	return fmt.Sprintf("Moved: %s -> %s", log.SourcePath, log.TargetPath)
+}
+
+func MoveSabunFileAndAdditionalSoundFiles(sabunDirPath string, sabunInfo *SabunInfo) ([]MovedFileLog, error) {
 	getTargetPath := func(dir, src string, duplicationNum int) string {
 		base := filepath.Base(src)
 		if duplicationNum == 0 {
@@ -491,7 +507,8 @@ func MoveSabunFileAndAdditionalSoundFiles(sabunDirPath string, sabunInfo *SabunI
 		}
 	}
 
-	move := func(sourcePath, targetDirPath string, isSabun bool) error {
+	move := func(sourcePath, targetDirPath string, isSabun bool) ([]MovedFileLog, error) {
+		moveFileLogs := []MovedFileLog{}
 		var targetPath string
 		if isSabun {
 			// ファイル名が重複したらナンバリングを追加して再試行
@@ -500,10 +517,10 @@ func MoveSabunFileAndAdditionalSoundFiles(sabunDirPath string, sabunInfo *SabunI
 				if fileExists(targetPath) {
 					// ファイル名が同じで内容も同じファイルが存在するなら、ファイル移動処理をスキップする
 					if same, err := isSameFile(sourcePath, targetPath); err != nil {
-						return fmt.Errorf("Failed isSameFile: %w", err)
+						return nil, fmt.Errorf("Failed isSameFile: %w", err)
 					} else if same {
-						fmt.Printf("Skip because the same file already exist: %s %s\n", sourcePath, targetPath)
-						return nil
+						moveFileLogs = append(moveFileLogs, MovedFileLog{SourcePath: sourcePath, TargetPath: targetPath, IsSkipped: true})
+						return moveFileLogs, nil
 					}
 				} else {
 					break
@@ -513,48 +530,52 @@ func MoveSabunFileAndAdditionalSoundFiles(sabunDirPath string, sabunInfo *SabunI
 			targetPath = getTargetPath(targetDirPath, sourcePath, 0)
 			// bmsファイル以外(追加音源ファイルなど)は、移動先に同名ファイルが存在したら、移動処理をスキップする
 			if fileExists(targetPath) {
-				fmt.Printf("Skip because the same file already exist: %s %s\n", sourcePath, targetPath)
-				return nil
+				moveFileLogs = append(moveFileLogs, MovedFileLog{SourcePath: sourcePath, TargetPath: targetPath, IsSkipped: true})
+				return moveFileLogs, nil
 			}
 		}
 
-		//fmt.Printf("move %s => %s\n", sourcePath, targetPath)
-
 		if err := moveFile(sourcePath, targetPath); err != nil {
-			return fmt.Errorf("Failed to move: %w", err)
+			return nil, fmt.Errorf("Failed to move: %w", err)
 		}
-		fmt.Printf("Moved: %s -> %s\n", sourcePath, targetPath)
+		moveFileLogs = append(moveFileLogs, MovedFileLog{SourcePath: sourcePath, TargetPath: targetPath})
 
 		// move後のディレクトリが空(もしくは.txtファイルのみ)ならディレクトリを削除する
 		movedDirPath := filepath.Dir(sourcePath)
 		if filepath.Clean(movedDirPath) != filepath.Clean(sabunDirPath) {
 			if removed, err := removeEmptyDirectory(movedDirPath); err != nil {
-				return fmt.Errorf("Failed to remove empty directory: %w", err)
+				return moveFileLogs, fmt.Errorf("Failed to remove empty directory: %w", err)
 			} else if removed {
-				fmt.Printf("- Removed empty dir: %s\n", movedDirPath)
+				moveFileLogs = append(moveFileLogs, MovedFileLog{SourcePath: movedDirPath, IsRemovedDir: true})
 			}
 		}
 
-		return nil
+		return moveFileLogs, nil
 	}
 
 	if sabunInfo.TargetSearchResult == nil {
-		return fmt.Errorf("TargetSearchResult is nil")
+		return nil, fmt.Errorf("TargetSearchResult is nil")
 	}
 
+	moveFileLogs := []MovedFileLog{}
+
 	// 差分BMSファイル移動
-	if err := move(sabunInfo.BmsData.Path, sabunInfo.TargetSearchResult.TargetBmsDirPath, true); err != nil {
-		return err
+	if logs, err := move(sabunInfo.BmsData.Path, sabunInfo.TargetSearchResult.TargetBmsDirPath, true); err != nil {
+		return nil, err
+	} else {
+		moveFileLogs = append(moveFileLogs, logs...)
 	}
 	// 追加音源ファイル移動
 	// TODO 音源が直下でなくディレクトリ内にある場合、移動先にディレクトリを作る必要があるかも？
 	for _, AdditionalSoundFilePath := range sabunInfo.AdditionalSoundFilePaths {
-		if err := move(AdditionalSoundFilePath, sabunInfo.TargetSearchResult.TargetBmsDirPath, false); err != nil {
-			return err
+		if logs, err := move(AdditionalSoundFilePath, sabunInfo.TargetSearchResult.TargetBmsDirPath, false); err != nil {
+			return moveFileLogs, err
+		} else {
+			moveFileLogs = append(moveFileLogs, logs...)
 		}
 	}
 
-	return nil
+	return moveFileLogs, nil
 }
 
 func isSameFile(path1, path2 string) (bool, error) {
