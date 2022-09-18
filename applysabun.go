@@ -167,12 +167,14 @@ func makeSabunInfo(sabunPath string, soundFilePaths []string) (*SabunInfo, error
 	}
 
 	additionalSoundFilePaths := []string{}
-	wavDefs := copyMap(bmsData.UniqueBmsData.WavDefs)
-	for _, path := range soundFilePaths {
-		for key, wavDef := range wavDefs {
-			if getPureFileName(path) == getPureFileName(wavDef) {
-				additionalSoundFilePaths = append(additionalSoundFilePaths, path)
-				delete(wavDefs, key)
+	if bmsData.UniqueBmsData != nil {
+		wavDefs := copyMap(bmsData.UniqueBmsData.WavDefs)
+		for _, path := range soundFilePaths {
+			for key, wavDef := range wavDefs {
+				if getPureFileName(path) == getPureFileName(wavDef) {
+					additionalSoundFilePaths = append(additionalSoundFilePaths, path)
+					delete(wavDefs, key)
+				}
 			}
 		}
 	}
